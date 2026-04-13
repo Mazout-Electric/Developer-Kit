@@ -1,0 +1,140 @@
+import sys
+import os
+import threading
+import time
+from .scservo_sdk import *
+sys.path.append('..')
+
+from state import vehicle_state
+
+# --- Configuration ---
+MOTOR1_ID  = 1
+MOTOR2_ID  = 2
+DEVICENAME = '/dev/ttySTM4'
+BAUDRATE   = 1000000
+SPEED      = 2400
+ACC        = 50
+
+class Brakes:
+    def __init__(self):
+        self.running = False
+        self.to_brake = 0.0
+        self._last_sent_brake = None 
+        
+        self.serial_lock = threading.Lock()
+        
+        self.portHandler = PortHandler(DEVICENAME)
+        self.packetHandler = sms_sts(self.portHandler)
+        
+        if not self.portHandler.openPort() or not self.portHandler.setBaudRate(BAUDRATE):
+            #print("Failed to connect to servos")
+            sys.exit(1)
+
+    def move_to_angle(self, m_id, target_angle):
+        pos_target = int((target_angle / 360.0) * 4095)
+        pos_target = max(0, min(4095, pos_target)) 
+        
+        with self.serial_lock:
+            self.packetHandler.WritePosEx(m_id, pos_target, SPEED, ACC)
+        return pos_target
+    def get_current_angle(self,m_id):
+        pos, speed, res, err = self.packetHandler.ReadPosSpeed(m_id)
+        if res == COMM_SUCCESS:
+            angle = round((pos * 360.0) / 4095.0, 1)
+            return angle, pos
+        return None, None
+    def enableT(self, m_id, enable):
+        return self.packetHandler.enableTorque(m_id, enable)
+    def readtemp(self, m_id):
+        temp, res, err = self.packetHandler.ReadTemper(m_id)
+        if res==COMM_SUCCESS:
+            return temp
+        return None
+    def readLoad(self, m_id):
+        load, res, err = self.packetHandler.ReadLoad(m_id)
+        if res == COMM_SUCCESS:
+            return load
+        return None
+    def update_brakes(self, value):
+        value = max(0, min(100, value))
+        angle = (value / 100.0) * 40.0
+        self.to_brake = angle
+    def update_brakes_info(self):
+        load1=self.readLoad(MOTOR1_ID)
+        temp1=self.readtemp(MOTOR1_ID)
+        load2=self.readLoad(MOTOR2_ID)
+        temp2=self.readtemp(MOTOR2_ID)                                                                        
+        vehicle_state["brakes_temperature_right"] = temp2
+        vehicle_state["brakes_temperature_left"] = temp1
+        vehicle_state["brakes_load_right"] = load2
+        vehicle_state["brakes_load_left"] = load1
+        ang1 =self.get_current_angle(MOTOR1_ID)
+        ang2 = self.get_current_angle(MOTOR2_ID)
+        vehicle_state["brakes_angle_right"] = ang2
+        vehicle_state["brakes_angle_left"] = ang1
+
+        return 
+    def control_loop(self):
+        #print("Brakes loop started.")
+        try:
+            while self.running:
+                curr_ang , curr_pos = self.get_current_angle(MOTOR1_ID)
+                curr_ang1 , curr_pos = self.get_current_angle(MOTOR2_ID)
+                #print("curr_ang = ", curr_ang)
+                #print("curr_ang1 = ", curr_ang1)
+                target_brake = self.to_brake
+                #self.enableT(MOTOR1_ID,0)
+                #self.enableT(MOTOR2_ID,0)
+                #l1=self.readLoad(MOTOR1_ID)
+                #t1=self.readtemp(MOTOR1_ID)
+                #l2=self.readLoad(MOTOR2_ID)
+                #t2=self.readtemp(MOTOR2_ID)
+                #print("INIT LOAD TAKEN BY MOTOR1 LEFT= ", l1)
+                #print("INIT TEMP BY MOTOR1 LEFT= ", t1)
+                #print("INIT LOAD TAKEN BY MOTOR2 RIGHT = ", l2)
+                #print("INIT TEMP BY MOTOR2 RIGHT= ", t2)
+
+                if target_brake != self._last_sent_brake:
+                    if target_brake == 0:
+                        #print("brakes released")
+                        #print("to brake = ", target_brake)
+                        self.move_to_angle(MOTOR1_ID, 150)
+                        self.move_to_angle(MOTOR2_ID, 280)
+                        self.enableT(MOTOR1_ID, 0)
+                        self.enableT(MOTOR2_ID,0)
+                        
+                    else:
+                        target_angle = 150 - target_brake
+                        #print("brakes applied")
+                        #print("to brake = ", target_angle)
+                        self.enableT(MOTOR1_ID,1)
+                        self.enableT(MOTOR2_ID,1)
+                        self.move_to_angle(MOTOR1_ID, 120)
+                        self.move_to_angle(MOTOR2_ID, 310)
+                    self._last_sent_brake = target_brake
+                self.update_brakes_info() 
+                time.sleep(0.05)
+                
+        finally:
+            #print("\nShutting down brakes...")
+            self.move_to_angle(MOTOR1_ID, 150)
+            self.move_to_angle(MOTOR2_ID, 280)
+            self.enableT(MOTOR1_ID,0)
+            self.enableT(MOTOR2_ID,0)
+            time.sleep(0.1) 
+            with self.serial_lock:
+                self.portHandler.closePort()
+            #print("Port Closed. Thread exiting.")
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self.control_loop, daemon=True)
+        self.thread.start()
+        print("Brake thread initialized.")
+
+    def stop(self):
+        self.running = False
+        self.move_to_angle(MOTOR1_ID,120)
+        self.move_to_angle(MOTOR2_ID,280)
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
